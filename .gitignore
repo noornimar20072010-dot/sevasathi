@@ -1,0 +1,33 @@
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Database
+chroma_db/
+*.sqlite3
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+
+# Temporary / Scratch
+scratch.py
+fix_prints.py
+fix_prompt.py
+update_fonts.py
+update_main.py
+rewrite.py
+rewrite_chat.py
