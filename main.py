@@ -66,34 +66,61 @@ async def ask_question(request: AskRequest):
         raise HTTPException(status_code=500, detail="Groq API key not configured.")
 
     try:
-        # 1. Rewrite the question using conversation history (if any) into a standalone question
+        # 1. Rewrite / Normalize the question
         actual_question = request.question
-        if request.history or request.language in ["hi", "pa"]:
+        
+        has_devanagari = bool(re.search(r'[\u0900-\u097F]', request.question))
+        has_gurmukhi = bool(re.search(r'[\u0A00-\u0A7F]', request.question))
+        is_non_english = has_devanagari or has_gurmukhi
+        
+        needs_rewrite = True
+        
+        if needs_rewrite:
             recent_history = request.history[-2:] if request.history else []
             history_text = "\n".join([f"User: {h.question}\nAssistant: {h.answer}" for h in recent_history])
             
-            rewrite_prompt = (
-                "You are an expert translator and query rewriter.\n\n"
-                "Translate the following question into English if it is in Hindi or Punjabi. "
-                "Also, make it a standalone question using the provided conversation history. "
-                "If the conversation history is empty, just translate the question.\n\n"
-                f"Conversation History:\n{history_text}\n\n"
-                f"Latest Question: {request.question}\n\n"
-                "Output ONLY the standalone English question and nothing else.\n"
-                "Standalone Question (in English):"
-            )
+            if is_non_english:
+                instruction = "Translate this question about Indian government schemes into clear English. Keep scheme names in their standard English form (for example Ayushman Bharat, PM-Kisan). Return ONLY the English question, nothing else."
+                if request.history:
+                    instruction += " Use the conversation history to make it a standalone question."
+            else:
+                instruction = "Rewrite the latest question to be a standalone question in English that includes all relevant context mentioned previously. If it's already standalone, just output the original question in English. Return ONLY the English question, nothing else."
+                if not request.history:
+                    needs_rewrite = False
             
-            rewrite_response = groq_client.chat.completions.create(
-                model="openai/gpt-oss-120b",
-                messages=[{"role": "user", "content": rewrite_prompt}],
-                max_tokens=100,
-                temperature=0
-            )
-            actual_question = rewrite_response.choices[0].message.content.strip()
-            if actual_question.startswith('"') and actual_question.endswith('"'):
-                actual_question = actual_question[1:-1]
-            print(f"Original Question: {request.question.encode('cp1252', 'replace').decode('cp1252')}")
-            print(f"Rewritten Question: {actual_question.encode('cp1252', 'replace').decode('cp1252')}")
+            if needs_rewrite:
+                rewrite_prompt = (
+                    f"{instruction}\n\n"
+                    f"Conversation History:\n{history_text}\n\n"
+                    f"Latest Question: {request.question}\n\n"
+                    "English Query:"
+                )
+                
+                try:
+                    rewrite_response = groq_client.chat.completions.create(
+                        model="openai/gpt-oss-120b",
+                        messages=[{"role": "user", "content": rewrite_prompt}],
+                        max_tokens=300,
+                        temperature=0,
+                        reasoning_effort="low"
+                    )
+                    ans = rewrite_response.choices[0].message.content.strip()
+                    if ans.startswith('"') and ans.endswith('"'):
+                        ans = ans[1:-1]
+                        
+                    # If empty, or much shorter than original, fallback
+                    if not ans or len(ans) < 3:
+                        actual_question = request.question
+                    else:
+                        actual_question = ans
+                except Exception as e:
+                    print(f"Rewrite error: {e}")
+                    actual_question = request.question
+                    
+        # Add a print statement to the terminal: 'Original: ... | English query: ...'
+        safe_orig = request.question.encode('cp1252', 'replace').decode('cp1252')
+        safe_actual = actual_question.encode('cp1252', 'replace').decode('cp1252')
+        print(f"Original: {safe_orig} | English query: {safe_actual}")
 
         q_lower = actual_question.lower()
         needs_docs = any(w in q_lower for w in ["document", "documents", "papers", "required"])
@@ -199,7 +226,11 @@ async def ask_question(request: AskRequest):
                     break
             
             # 4. Decide response mode based on step 3 results
-            if best_distance < 0.5:
+            if best_distance > 0.6:
+                final_docs = []
+                final_metas = []
+                response_mode = "normal"
+            elif best_distance < 0.5:
                 # Treat as a confident single-scheme answer
                 response_mode = "normal"
             else:
@@ -210,7 +241,7 @@ async def ask_question(request: AskRequest):
                     response_mode = "normal"
 
         
-        if len(question_words) == 0:
+        if len(request.question.strip()) < 2:
             if request.language == "hi":
                 return AskResponse(answer="मुझे यकीन नहीं है कि आप क्या जानना चाहते हैं। कृपया किसी सरकारी योजना के बारे में पूछें।", sources=[])
             elif request.language == "pa":
@@ -226,6 +257,7 @@ async def ask_question(request: AskRequest):
             else:
                 return AskResponse(answer="No information found for that scheme.", sources=[])
 
+        print(f"Chunks retrieved: {len(final_docs)}")
         # 5. Send the finalized context to Groq
         context = "\n\n---\n\n".join(final_docs)
         
